@@ -1,5 +1,7 @@
 import os
+import hashlib
 import secrets
+import threading
 from datetime import datetime
 
 from flask import Flask, request, jsonify, Response
@@ -11,8 +13,6 @@ from openai import OpenAI
 # =========================================================
 
 app = Flask(__name__)
-
-# JSON 顯示中文
 app.json.ensure_ascii = False
 
 
@@ -49,7 +49,7 @@ except ValueError:
 
 
 # =========================================================
-# OpenAI Client
+# OpenAI
 # =========================================================
 
 client = OpenAI(
@@ -58,14 +58,32 @@ client = OpenAI(
 
 
 # =========================================================
-# Helper Functions
+# Temporary Job Storage
+# =========================================================
+
+# 測試版：
+#
+# job ID
+#   ↓
+# response_id
+#
+# 例如：
+#
+# ABC001 → resp_xxxxx
+#
+# 注意：
+# Render 重啟後這些資料會消失。
+#
+JOBS = {}
+
+JOBS_LOCK = threading.Lock()
+
+
+# =========================================================
+# Helpers
 # =========================================================
 
 def no_cache(response):
-    """
-    避免一般瀏覽器 / Proxy 快取。
-    ChatGPT Search 仍建議每次使用不同 nonce。
-    """
 
     response.headers["Cache-Control"] = (
         "no-store, no-cache, must-revalidate, max-age=0"
@@ -78,37 +96,28 @@ def no_cache(response):
 
 
 def check_token():
-    """
-    PoC 用簡單 Relay Token。
 
-    如果 Render 有設定 RELAY_TOKEN，
-    request 就必須帶正確 token。
-
-    如果沒有設定 RELAY_TOKEN，
-    則暫時不啟用 token 驗證。
-    """
-
+    # 如果沒有設定 RELAY_TOKEN
+    # 暫時不驗證
     if not RELAY_TOKEN:
         return True
 
-    provided_token = request.args.get(
+    token = request.args.get(
         "token",
         ""
     ).strip()
 
     return secrets.compare_digest(
-        provided_token,
+        token,
         RELAY_TOKEN
     )
 
 
-def unauthorized_response():
-    response = jsonify({
-        "success": False,
-        "error": "Unauthorized"
-    })
+def question_hash(question):
 
-    return no_cache(response), 401
+    return hashlib.sha256(
+        question.encode("utf-8")
+    ).hexdigest()
 
 
 # =========================================================
@@ -130,22 +139,21 @@ def home():
 
     <body>
 
-        <h1>C Exam Relay API</h1>
+        <h1>C Exam Relay</h1>
 
         <p>Server is running.</p>
 
-        <p>Architecture:</p>
-
         <pre>
-/submit
-   ↓
-OpenAI Background Response
-   ↓
-response_id
-   ↓
-/result
-   ↓
-final answer
+/task
+
+First request:
+Create background AI job
+
+Later request:
+Check same job
+
+Completed:
+Return C answer
         </pre>
 
     </body>
@@ -176,7 +184,7 @@ Allow: /
 
 
 # =========================================================
-# Health Check
+# Health
 # =========================================================
 
 @app.get("/health")
@@ -188,15 +196,15 @@ def health():
 
         "service": "C Exam Relay",
 
-        "backend": "OpenAI Responses API",
-
-        "mode": "background",
+        "architecture": "single-task-endpoint",
 
         "model": OPENAI_MODEL,
 
         "reasoning_effort": OPENAI_REASONING_EFFORT,
 
         "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+
+        "jobs_in_memory": len(JOBS),
 
         "server_time": datetime.now().isoformat()
     })
@@ -205,18 +213,24 @@ def health():
 
 
 # =========================================================
-# SUBMIT
+# TASK
 # =========================================================
 
-@app.get("/submit")
-def submit():
+@app.get("/task")
+def task():
 
     # -----------------------------------------------------
-    # Token Check
+    # Authentication
     # -----------------------------------------------------
 
     if not check_token():
-        return unauthorized_response()
+
+        response = jsonify({
+            "success": False,
+            "error": "Unauthorized"
+        })
+
+        return no_cache(response), 401
 
 
     # -----------------------------------------------------
@@ -228,8 +242,13 @@ def submit():
         ""
     ).strip()
 
-    nonce = request.args.get(
-        "nonce",
+    job_id = request.args.get(
+        "job",
+        ""
+    ).strip()
+
+    cache_buster = request.args.get(
+        "cb",
         ""
     ).strip()
 
@@ -242,22 +261,31 @@ def submit():
 
         response = jsonify({
             "success": False,
-            "error": "沒有收到 q 參數",
-            "nonce": nonce
+            "error": "沒有收到 q 參數"
         })
 
         return no_cache(response), 400
 
 
-    # 防止有人丟超長 prompt 燒 API
-    if len(question) > 5000:
+    if not job_id:
 
         response = jsonify({
             "success": False,
+            "error": "沒有收到 job 參數"
+        })
+
+        return no_cache(response), 400
+
+
+    if len(question) > 5000:
+
+        response = jsonify({
+
+            "success": False,
+
             "error": "題目過長",
-            "max_length": 5000,
-            "question_length": len(question),
-            "nonce": nonce
+
+            "question_length": len(question)
         })
 
         return no_cache(response), 400
@@ -266,229 +294,223 @@ def submit():
     if not OPENAI_API_KEY:
 
         response = jsonify({
+
             "success": False,
-            "error": "Server 尚未設定 OPENAI_API_KEY",
-            "nonce": nonce
+
+            "error": "OPENAI_API_KEY 未設定"
         })
 
         return no_cache(response), 500
 
 
-    # -----------------------------------------------------
-    # Log
-    # -----------------------------------------------------
-
-    print("\n========================================")
-    print("NEW BACKGROUND REQUEST")
-    print("nonce:", nonce)
-    print("model:", OPENAI_MODEL)
-    print("reasoning:", OPENAI_REASONING_EFFORT)
-    print("question:")
-    print(question)
-    print("========================================\n")
+    current_hash = question_hash(
+        question
+    )
 
 
-    # -----------------------------------------------------
-    # OpenAI Background Request
-    # -----------------------------------------------------
+    # =====================================================
+    # Create or find existing job
+    # =====================================================
 
     try:
 
-        ai_response = client.responses.create(
+        with JOBS_LOCK:
 
-            model=OPENAI_MODEL,
+            existing_job = JOBS.get(
+                job_id
+            )
 
-            reasoning={
-                "effort": OPENAI_REASONING_EFFORT
-            },
 
-            instructions="""
+            # -------------------------------------------------
+            # NEW JOB
+            # -------------------------------------------------
+
+            if existing_job is None:
+
+                print("\n====================================")
+                print("CREATE NEW JOB")
+                print("job:", job_id)
+                print("cb:", cache_buster)
+                print("model:", OPENAI_MODEL)
+                print("question:", question)
+                print("====================================\n")
+
+
+                ai_response = client.responses.create(
+
+                    model=OPENAI_MODEL,
+
+                    reasoning={
+                        "effort": OPENAI_REASONING_EFFORT
+                    },
+
+                    instructions="""
 你是一個專門處理 C 語言程式設計考題的程式設計助教。
 
-請仔細分析使用者提供的題目後作答。
+請仔細分析題目。
 
 要求：
 
 1. 必須使用 C 語言。
 
-2. 先正確理解：
+2. 正確理解：
    - 輸入格式
    - 輸出格式
-   - 題目限制
-   - 邊界條件
+   - 限制條件
+   - 邊界情況
 
-3. 如果題目需要演算法，
-   請選擇正確且合理有效率的方法。
+3. 若題目需要演算法，
+   選擇正確且效率合理的方法。
 
 4. 特別注意：
    - 陣列邊界
    - 整數溢位
-   - 迴圈條件
-   - 字串結尾
+   - 迴圈
+   - 字串
    - 指標
-   - 記憶體
-   - scanf / printf 格式
+   - scanf
+   - printf
    - 空格
    - 換行
    - 大小寫
    - 特殊符號
 
-5. 如果題目要求輸出特定圖形，
-   必須嚴格遵守其空格與換行格式。
+5. 題目要求特殊輸出時，
+   必須嚴格符合格式。
 
-6. 不要假設題目沒有提供的條件。
+6. 不可以自行加入題目沒有提供的條件。
 
-7. 最後必須提供完整、
+7. 最後提供完整、
    可以直接編譯執行的 C 程式碼。
 
-8. 不要加入與解題無關的長篇內容。
-
-9. 如果題目資訊不足，
-   請明確指出缺少什麼資訊。
+8. 不要加入無關的長篇說明。
 """,
 
-            input=question,
+                    input=question,
 
-            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                    max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
 
-            # 關鍵：
-            # 不等待整個模型推理完成
-            background=True
-        )
+                    background=True,
 
-
-        # -------------------------------------------------
-        # Immediately return response_id
-        # -------------------------------------------------
-
-        response = jsonify({
-
-            "success": True,
-
-            "stage": "submitted",
-
-            "status": ai_response.status,
-
-            "response_id": ai_response.id,
-
-            "nonce": nonce,
-
-            "received_question": question,
-
-            "question_length": len(question),
-
-            "answer_source": "OPENAI_BACKGROUND_API",
-
-            "model": OPENAI_MODEL,
-
-            "reasoning_effort": OPENAI_REASONING_EFFORT,
-
-            "verification_code": "CEXAM-9527",
-
-            "server_time": datetime.now().isoformat()
-        })
+                    metadata={
+                        "relay_job": job_id
+                    }
+                )
 
 
-        return no_cache(response)
+                JOBS[job_id] = {
+
+                    "response_id": ai_response.id,
+
+                    "question_hash": current_hash,
+
+                    "question": question,
+
+                    "created_at": datetime.now().isoformat()
+                }
 
 
-    except Exception as e:
+                response = jsonify({
 
-        print(
-            "OpenAI SUBMIT ERROR:",
-            type(e).__name__,
-            str(e)
-        )
+                    "success": True,
 
-        response = jsonify({
+                    "job": job_id,
 
-            "success": False,
+                    "cb": cache_buster,
 
-            "stage": "submit",
+                    "stage": "submitted",
 
-            "nonce": nonce,
+                    "status": ai_response.status,
 
-            "error": "OpenAI background request failed",
+                    "ready": (
+                        ai_response.status == "completed"
+                    ),
 
-            "error_type": type(e).__name__,
+                    "answer_source":
+                        "OPENAI_BACKGROUND_API",
 
-            "server_time": datetime.now().isoformat()
-        })
+                    "model": OPENAI_MODEL,
 
-        return no_cache(response), 500
+                    "reasoning_effort":
+                        OPENAI_REASONING_EFFORT,
 
+                    "verification_code":
+                        "CEXAM-9527",
 
-# =========================================================
-# RESULT
-# =========================================================
+                    "message":
+                        "AI 已開始處理。若 ready=false，請稍後用相同 job 與題目、但新的 cb 再查詢。",
 
-@app.get("/result")
-def result():
-
-    # -----------------------------------------------------
-    # Token Check
-    # -----------------------------------------------------
-
-    if not check_token():
-        return unauthorized_response()
+                    "server_time":
+                        datetime.now().isoformat()
+                })
 
 
-    # -----------------------------------------------------
-    # Parameters
-    # -----------------------------------------------------
+                # 如果簡單題竟然馬上完成
+                if ai_response.status == "completed":
 
-    response_id = (
-        request.args.get("id", "").strip()
-        or
-        request.args.get("response_id", "").strip()
-    )
+                    response = jsonify({
 
-    nonce = request.args.get(
-        "nonce",
-        ""
-    ).strip()
+                        "success": True,
 
+                        "job": job_id,
 
-    # -----------------------------------------------------
-    # Validation
-    # -----------------------------------------------------
+                        "cb": cache_buster,
 
-    if not response_id:
+                        "stage": "completed",
 
-        response = jsonify({
+                        "status": "completed",
 
-            "success": False,
+                        "ready": True,
 
-            "error": "沒有收到 response id",
+                        "verification_code":
+                            "CEXAM-9527",
 
-            "nonce": nonce
-        })
+                        "answer_source":
+                            "OPENAI_BACKGROUND_API",
 
-        return no_cache(response), 400
+                        "model": ai_response.model,
 
+                        "answer":
+                            ai_response.output_text,
 
-    # 基本格式限制
-    if not response_id.startswith("resp_"):
-
-        response = jsonify({
-
-            "success": False,
-
-            "error": "response id 格式不正確",
-
-            "response_id": response_id,
-
-            "nonce": nonce
-        })
-
-        return no_cache(response), 400
+                        "server_time":
+                            datetime.now().isoformat()
+                    })
 
 
-    # -----------------------------------------------------
-    # Retrieve Response
-    # -----------------------------------------------------
+                return no_cache(response)
 
-    try:
+
+            # -------------------------------------------------
+            # EXISTING JOB
+            # -------------------------------------------------
+
+            if (
+                existing_job["question_hash"]
+                != current_hash
+            ):
+
+                response = jsonify({
+
+                    "success": False,
+
+                    "error":
+                        "這個 job 已經被另一個題目使用",
+
+                    "job": job_id
+                })
+
+                return no_cache(response), 409
+
+
+            response_id = existing_job[
+                "response_id"
+            ]
+
+
+        # =================================================
+        # Retrieve outside lock
+        # =================================================
 
         ai_response = client.responses.retrieve(
             response_id
@@ -497,16 +519,16 @@ def result():
         status = ai_response.status
 
 
-        print("\n========================================")
-        print("RESULT CHECK")
-        print("response_id:", response_id)
-        print("nonce:", nonce)
+        print("\n====================================")
+        print("CHECK JOB")
+        print("job:", job_id)
+        print("cb:", cache_buster)
         print("status:", status)
-        print("========================================\n")
+        print("====================================\n")
 
 
         # -------------------------------------------------
-        # Still processing
+        # Processing
         # -------------------------------------------------
 
         if status in {
@@ -518,19 +540,26 @@ def result():
 
                 "success": True,
 
+                "job": job_id,
+
+                "cb": cache_buster,
+
                 "stage": "processing",
 
                 "status": status,
 
-                "response_id": response_id,
-
-                "nonce": nonce,
-
                 "ready": False,
 
-                "message": "答案仍在產生中，請稍後使用新的 nonce 再查詢。",
+                "answer_source":
+                    "OPENAI_BACKGROUND_API",
 
-                "server_time": datetime.now().isoformat()
+                "model": OPENAI_MODEL,
+
+                "message":
+                    "答案仍在產生中。請使用相同 job 和 q，將 cb 換成新值後再次查詢。",
+
+                "server_time":
+                    datetime.now().isoformat()
             })
 
             return no_cache(response)
@@ -542,11 +571,13 @@ def result():
 
         if status == "completed":
 
-            answer = ai_response.output_text
-
             response = jsonify({
 
                 "success": True,
+
+                "job": job_id,
+
+                "cb": cache_buster,
 
                 "stage": "completed",
 
@@ -554,127 +585,48 @@ def result():
 
                 "ready": True,
 
-                "response_id": response_id,
+                "verification_code":
+                    "CEXAM-9527",
 
-                "nonce": nonce,
+                "answer_source":
+                    "OPENAI_BACKGROUND_API",
 
-                "verification_code": "CEXAM-9527",
+                "model":
+                    ai_response.model,
 
-                "answer_source": "OPENAI_BACKGROUND_API",
+                "answer":
+                    ai_response.output_text,
 
-                "model": ai_response.model,
-
-                "answer": answer,
-
-                "server_time": datetime.now().isoformat()
+                "server_time":
+                    datetime.now().isoformat()
             })
 
             return no_cache(response)
 
 
         # -------------------------------------------------
-        # Incomplete
-        # -------------------------------------------------
-
-        if status == "incomplete":
-
-            response = jsonify({
-
-                "success": False,
-
-                "stage": "incomplete",
-
-                "status": status,
-
-                "ready": False,
-
-                "response_id": response_id,
-
-                "nonce": nonce,
-
-                "error": "OpenAI response incomplete",
-
-                "server_time": datetime.now().isoformat()
-            })
-
-            return no_cache(response), 500
-
-
-        # -------------------------------------------------
-        # Failed
-        # -------------------------------------------------
-
-        if status == "failed":
-
-            response = jsonify({
-
-                "success": False,
-
-                "stage": "failed",
-
-                "status": status,
-
-                "ready": False,
-
-                "response_id": response_id,
-
-                "nonce": nonce,
-
-                "error": "OpenAI response failed",
-
-                "server_time": datetime.now().isoformat()
-            })
-
-            return no_cache(response), 500
-
-
-        # -------------------------------------------------
-        # Cancelled
-        # -------------------------------------------------
-
-        if status == "cancelled":
-
-            response = jsonify({
-
-                "success": False,
-
-                "stage": "cancelled",
-
-                "status": status,
-
-                "ready": False,
-
-                "response_id": response_id,
-
-                "nonce": nonce,
-
-                "error": "OpenAI response cancelled",
-
-                "server_time": datetime.now().isoformat()
-            })
-
-            return no_cache(response), 500
-
-
-        # -------------------------------------------------
-        # Unknown Status
+        # Terminal errors
         # -------------------------------------------------
 
         response = jsonify({
 
             "success": False,
 
+            "job": job_id,
+
+            "cb": cache_buster,
+
+            "stage": "failed",
+
             "status": status,
 
             "ready": False,
 
-            "response_id": response_id,
+            "error":
+                "OpenAI response 未正常完成",
 
-            "nonce": nonce,
-
-            "error": "未知的 OpenAI response status",
-
-            "server_time": datetime.now().isoformat()
+            "server_time":
+                datetime.now().isoformat()
         })
 
         return no_cache(response), 500
@@ -683,7 +635,7 @@ def result():
     except Exception as e:
 
         print(
-            "OpenAI RESULT ERROR:",
+            "TASK ERROR:",
             type(e).__name__,
             str(e)
         )
@@ -692,28 +644,29 @@ def result():
 
             "success": False,
 
-            "stage": "result",
+            "job": job_id,
 
-            "response_id": response_id,
+            "cb": cache_buster,
 
-            "nonce": nonce,
+            "error":
+                "處理 task 時發生錯誤",
 
-            "error": "讀取 OpenAI response 失敗",
+            "error_type":
+                type(e).__name__,
 
-            "error_type": type(e).__name__,
-
-            "server_time": datetime.now().isoformat()
+            "server_time":
+                datetime.now().isoformat()
         })
 
         return no_cache(response), 500
 
 
 # =========================================================
-# Old /solve Endpoint
+# Old endpoints
 # =========================================================
 
-@app.get("/solve")
-def old_solve():
+@app.get("/submit")
+def deprecated_submit():
 
     response = jsonify({
 
@@ -721,18 +674,31 @@ def old_solve():
 
         "deprecated": True,
 
-        "message": "同步 /solve 已停用，請使用 /submit 與 /result。",
+        "message":
+            "請改用 /task"
+    })
 
-        "submit_endpoint": "/submit",
+    return no_cache(response), 410
 
-        "result_endpoint": "/result"
+
+@app.get("/result")
+def deprecated_result():
+
+    response = jsonify({
+
+        "success": False,
+
+        "deprecated": True,
+
+        "message":
+            "請改用 /task"
     })
 
     return no_cache(response), 410
 
 
 # =========================================================
-# Local Development
+# Local
 # =========================================================
 
 if __name__ == "__main__":
