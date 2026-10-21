@@ -1,66 +1,39 @@
 import os
-import hmac
+import re
 import hashlib
-import threading
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime
 
+import psycopg
 from flask import Flask, request, jsonify, Response
 from openai import OpenAI
 
 
-# ============================================================
-# C Exam Relay PoC
-#
-# Current architecture:
-#
-#   GET /task
-#
-#   First request:
-#       q + job + cb + token
-#           ↓
-#       OpenAI Responses API
-#       background=True
-#           ↓
-#       save:
-#       job -> response_id
-#
-#   Later requests:
-#       same q + same job + new cb
-#           ↓
-#       responses.retrieve(response_id)
-#
-#   Image question:
-#       q + img + job + cb + token
-#
-# img can be:
-#   - public https:// URL
-#   - public http:// URL
-#   - data:image/...;base64,...
-#
-# IMPORTANT:
-#   Same job MUST always use the same q and img.
-#
-# ============================================================
-
+# =========================================================
+# Flask
+# =========================================================
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 
 
-# ============================================================
-# Environment variables
-# ============================================================
+# =========================================================
+# Environment Variables
+# =========================================================
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
 
 OPENAI_MODEL = os.environ.get(
     "OPENAI_MODEL",
     "gpt-6-luna"
-).strip()
+)
 
 OPENAI_REASONING_EFFORT = os.environ.get(
     "OPENAI_REASONING_EFFORT",
     "low"
-).strip()
+)
 
 try:
     OPENAI_MAX_OUTPUT_TOKENS = int(
@@ -73,146 +46,91 @@ except ValueError:
     OPENAI_MAX_OUTPUT_TOKENS = 1800
 
 
-RELAY_TOKEN = os.environ.get(
-    "RELAY_TOKEN",
-    ""
-).strip()
-
-
-# ============================================================
-# Constants
-# ============================================================
-
-VERIFICATION_CODE = "CEXAM-9527"
-
-MAX_QUESTION_LENGTH = 5000
-
-MAX_JOB_LENGTH = 200
-
-
-# ============================================================
-# OpenAI client
-# ============================================================
+# =========================================================
+# OpenAI
+# =========================================================
 
 client = OpenAI(
     api_key=OPENAI_API_KEY
 )
 
 
-# ============================================================
-# In-memory job storage
-#
-# Example:
-#
-# JOBS["abc123"] = {
-#     "response_id": "resp_xxx",
-#     "fingerprint": "...",
-#     "created_at": "...",
-#     "has_image": True
-# }
-#
-# NOTE:
-# Render restart = this dictionary will be cleared.
-# This is acceptable for the current PoC.
-# ============================================================
+# =========================================================
+# Database
+# =========================================================
 
-JOBS = {}
+def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 尚未設定")
 
-JOBS_LOCK = threading.Lock()
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=8
+    )
 
 
-# ============================================================
-# Instructions for the model
-# ============================================================
+def init_db():
 
-C_EXAM_INSTRUCTIONS = """
-你是一個專門處理 C 語言程式設計考題的程式設計助教。
+    with get_db() as conn:
+        with conn.cursor() as cur:
 
-你的任務是仔細分析使用者提供的 C 語言考題。
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS relay_jobs (
+                    job_id TEXT PRIMARY KEY,
 
-題目可能包含：
-- 純文字
-- C 程式碼
-- 程式執行結果
-- 流程圖
-- 表格
-- 螢幕截圖
-- 題目照片
-- 文字與圖片的組合
+                    response_id TEXT UNIQUE NOT NULL,
 
-如果有圖片，請把圖片視為題目的一部分，
-仔細閱讀圖片中的程式碼、數字、表格、選項與題目條件。
+                    question_hash TEXT NOT NULL,
 
-回答時請特別注意：
+                    question TEXT NOT NULL,
 
-1. 必須按照 C 語言規則分析，不要把 C++、Java、Python 的規則混進來。
+                    model TEXT NOT NULL,
 
-2. 仔細處理：
-   - 變數型態
-   - 整數運算
-   - 浮點數運算
-   - 運算子優先順序
-   - 邏輯運算
-   - 條件判斷
-   - for / while / do-while
-   - 陣列
-   - 字串
-   - 指標
-   - 函式
-   - scanf
-   - printf
-   - 格式化輸出
-   - 記憶體
-   - 邊界條件
-   - overflow
-   - undefined behavior
+                    reasoning_effort TEXT NOT NULL,
 
-3. 如果題目要求程式最後輸出的結果，
-   請逐步模擬程式，不要只憑直覺猜答案。
+                    status TEXT NOT NULL,
 
-4. 如果題目要求撰寫程式，
-   請提供完整且可以編譯的 C 程式。
+                    answer TEXT,
 
-5. 如果題目有輸入輸出格式，
-   必須嚴格遵守指定格式。
+                    created_at TIMESTAMPTZ
+                        NOT NULL DEFAULT NOW(),
 
-6. 如果是選擇題，
-   請明確指出正確選項，並簡短解釋原因。
+                    updated_at TIMESTAMPTZ
+                        NOT NULL DEFAULT NOW(),
 
-7. 如果是程式碼追蹤題，
-   請追蹤重要變數在迴圈或條件中的變化。
+                    completed_at TIMESTAMPTZ
+                )
+            """)
 
-8. 如果圖片中的某個字元、數字或程式碼真的無法辨識，
-   不要自行捏造內容，應明確指出不確定的位置。
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                relay_jobs_status_idx
+                ON relay_jobs(status)
+            """)
 
-9. 回答應以正確解題為第一優先。
-   如果題目簡單，可以直接回答；
-   如果題目複雜，請提供必要的推理與步驟。
-
-10. 使用繁體中文回答，除非題目要求其他語言。
-""".strip()
+        conn.commit()
 
 
-# ============================================================
-# Utility functions
-# ============================================================
+try:
+    init_db()
+    print("Postgres initialization successful.")
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+except Exception as e:
+    print(
+        "DATABASE INIT ERROR:",
+        type(e).__name__,
+        str(e)
+    )
 
 
-def make_json(data, status_code=200):
-    """
-    Return JSON with aggressive no-cache headers.
-    cb is still used by the client as an additional cache buster.
-    """
+# =========================================================
+# Helpers
+# =========================================================
 
-    response = jsonify(data)
-    response.status_code = status_code
+def no_cache(response):
 
     response.headers["Cache-Control"] = (
-        "no-store, no-cache, must-revalidate, "
-        "max-age=0, private"
+        "no-store, no-cache, must-revalidate, max-age=0"
     )
 
     response.headers["Pragma"] = "no-cache"
@@ -221,279 +139,181 @@ def make_json(data, status_code=200):
     return response
 
 
-def request_fingerprint(question, image_url):
-    """
-    Bind one job to exactly one question + image.
+def json_reply(data, status_code=200):
 
-    If the same job is later reused with another q or img,
-    the fingerprint will be different and the request is rejected.
-    """
+    response = jsonify(data)
 
-    raw = (
-        question
-        + "\n---CEXAM-IMAGE---\n"
-        + image_url
-    )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
+    return no_cache(response), status_code
 
 
-def valid_image_value(image_url):
-    """
-    OpenAI Responses image input accepts:
-      - http://
-      - https://
-      - data:image/... base64 data URL
+def check_token():
 
-    For this GET-based relay, public HTTPS URLs are strongly preferred.
-    """
-
-    if not image_url:
+    if not RELAY_TOKEN:
         return True
 
-    lowered = image_url.lower()
-
-    return (
-        lowered.startswith("https://")
-        or lowered.startswith("http://")
-        or lowered.startswith("data:image/")
-    )
-
-
-def get_response_error_text(response):
-    """
-    Safely extract an OpenAI error if one exists.
-    """
-
-    try:
-        error = getattr(response, "error", None)
-
-        if error is None:
-            return None
-
-        message = getattr(error, "message", None)
-
-        if message:
-            return str(message)
-
-        return str(error)
-
-    except Exception:
-        return None
-
-
-def format_openai_response(
-    response,
-    job_id,
-    cb,
-    has_image
-):
-    """
-    Convert an OpenAI Response object into relay JSON.
-    """
-
-    status = getattr(
-        response,
-        "status",
-        "unknown"
-    )
-
-    model = getattr(
-        response,
-        "model",
-        OPENAI_MODEL
-    )
-
-    base = {
-        "job": job_id,
-        "cb": cb,
-        "status": status,
-        "model": model,
-        "has_image": has_image,
-        "verification_code": VERIFICATION_CODE,
-        "answer_source": "OPENAI_BACKGROUND_API",
-        "server_time": utc_now(),
-    }
-
-
-    # --------------------------------------------------------
-    # Still running
-    # --------------------------------------------------------
-
-    if status in {
-        "queued",
-        "in_progress"
-    }:
-
-        base.update({
-            "success": True,
-            "ready": False,
-            "stage": "processing",
-        })
-
-        return make_json(
-            base,
-            200
-        )
-
-
-    # --------------------------------------------------------
-    # Successfully completed
-    # --------------------------------------------------------
-
-    if status == "completed":
-
-        try:
-            answer = response.output_text or ""
-        except Exception:
-            answer = ""
-
-        base.update({
-            "success": True,
-            "ready": True,
-            "stage": "completed",
-            "answer": answer,
-        })
-
-        return make_json(
-            base,
-            200
-        )
-
-
-    # --------------------------------------------------------
-    # Terminal error states
-    # --------------------------------------------------------
-
-    error_text = get_response_error_text(
-        response
-    )
-
-    base.update({
-        "success": False,
-
-        # ready=True here means:
-        # stop polling; this job reached a terminal state.
-        "ready": True,
-
-        "stage": "terminal_error",
-        "error": (
-            error_text
-            or f"OpenAI response ended with status: {status}"
-        ),
-    })
-
-    return make_json(
-        base,
-        502
-    )
-
-
-# ============================================================
-# Root
-# ============================================================
-
-@app.route("/", methods=["GET"])
-def index():
-
-    return make_json({
-        "success": True,
-        "service": "C Exam Relay PoC",
-        "verification_code": VERIFICATION_CODE,
-        "endpoint": "/task",
-        "model": OPENAI_MODEL,
-        "reasoning_effort": OPENAI_REASONING_EFFORT,
-        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
-        "image_support": True,
-        "usage": (
-            "/task?"
-            "q=QUESTION&"
-            "img=OPTIONAL_IMAGE_URL&"
-            "job=JOB_ID&"
-            "cb=CACHE_BUSTER&"
-            "token=TOKEN"
-        ),
-        "server_time": utc_now(),
-    })
-
-
-# ============================================================
-# robots.txt
-# ============================================================
-
-@app.route("/robots.txt", methods=["GET"])
-def robots():
-
-    text = (
-        "User-agent: *\n"
-        "Disallow: /\n"
-    )
-
-    response = Response(
-        text,
-        mimetype="text/plain"
-    )
-
-    response.headers["Cache-Control"] = "no-store"
-
-    return response
-
-
-# ============================================================
-# Old endpoints
-#
-# We deliberately keep these disabled so an old client cannot
-# accidentally start using the previous two-endpoint design.
-# ============================================================
-
-@app.route("/submit", methods=["GET", "POST"])
-def deprecated_submit():
-
-    return make_json({
-        "success": False,
-        "error": (
-            "/submit is deprecated. "
-            "Use /task instead."
-        ),
-        "verification_code": VERIFICATION_CODE,
-        "server_time": utc_now(),
-    }, 410)
-
-
-@app.route("/result", methods=["GET", "POST"])
-def deprecated_result():
-
-    return make_json({
-        "success": False,
-        "error": (
-            "/result is deprecated. "
-            "Use /task instead."
-        ),
-        "verification_code": VERIFICATION_CODE,
-        "server_time": utc_now(),
-    }, 410)
-
-
-# ============================================================
-# Main endpoint
-# ============================================================
-
-@app.route("/task", methods=["GET"])
-def task():
-
-    # --------------------------------------------------------
-    # Read query parameters
-    # --------------------------------------------------------
-
-    question = request.args.get(
-        "q",
+    provided_token = request.args.get(
+        "token",
         ""
     ).strip()
 
-    image_url = request.args.get(
-        "img",
+    return secrets.compare_digest(
+        provided_token,
+        RELAY_TOKEN
+    )
+
+
+def question_hash(question):
+
+    return hashlib.sha256(
+        question.encode("utf-8")
+    ).hexdigest()
+
+
+def valid_job_id(job_id):
+
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z0-9_-]{1,64}",
+            job_id
+        )
+    )
+
+
+# =========================================================
+# Home
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>C Exam Relay</title>
+    </head>
+    <body>
+
+        <h1>C Exam Relay</h1>
+
+        <p>Server is running.</p>
+
+        <pre>
+/task
+  ↓
+Postgres job lookup
+  ↓
+OpenAI Background API
+  ↓
+Postgres persistence
+  ↓
+answer
+        </pre>
+
+    </body>
+    </html>
+    """
+
+
+# =========================================================
+# robots.txt
+# =========================================================
+
+@app.get("/robots.txt")
+def robots():
+
+    content = """
+User-agent: *
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+"""
+
+    return Response(
+        content,
+        mimetype="text/plain"
+    )
+
+
+# =========================================================
+# Health
+# =========================================================
+
+@app.get("/health")
+def health():
+
+    db_ok = False
+
+    try:
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+
+        db_ok = True
+
+    except Exception as e:
+
+        print(
+            "HEALTH DB ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+
+    return json_reply({
+
+        "success": True,
+
+        "service": "C Exam Relay",
+
+        "database": (
+            "connected"
+            if db_ok
+            else "error"
+        ),
+
+        "model": OPENAI_MODEL,
+
+        "reasoning_effort":
+            OPENAI_REASONING_EFFORT,
+
+        "max_output_tokens":
+            OPENAI_MAX_OUTPUT_TOKENS,
+
+        "server_time":
+            datetime.now().isoformat()
+    })
+
+
+# =========================================================
+# Main /task endpoint
+# =========================================================
+
+@app.get("/task")
+def task():
+
+    # -----------------------------------------------------
+    # Authentication
+    # -----------------------------------------------------
+
+    if not check_token():
+
+        return json_reply({
+            "success": False,
+            "error": "Unauthorized"
+        }, 401)
+
+
+    # -----------------------------------------------------
+    # Input
+    # -----------------------------------------------------
+
+    question = request.args.get(
+        "q",
         ""
     ).strip()
 
@@ -502,473 +322,752 @@ def task():
         ""
     ).strip()
 
-    cb = request.args.get(
+    cache_buster = request.args.get(
         "cb",
         ""
     ).strip()
 
-    supplied_token = request.args.get(
-        "token",
-        ""
-    )
 
-
-    # --------------------------------------------------------
-    # Authentication
-    # --------------------------------------------------------
-
-    if RELAY_TOKEN:
-
-        if not supplied_token:
-
-            return make_json({
-                "success": False,
-                "ready": True,
-                "error": "Missing token.",
-                "verification_code": VERIFICATION_CODE,
-                "server_time": utc_now(),
-            }, 401)
-
-
-        if not hmac.compare_digest(
-            supplied_token,
-            RELAY_TOKEN
-        ):
-
-            return make_json({
-                "success": False,
-                "ready": True,
-                "error": "Invalid token.",
-                "verification_code": VERIFICATION_CODE,
-                "server_time": utc_now(),
-            }, 403)
-
-
-    # --------------------------------------------------------
-    # Basic configuration check
-    # --------------------------------------------------------
-
-    if not OPENAI_API_KEY:
-
-        return make_json({
-            "success": False,
-            "ready": True,
-            "error": (
-                "OPENAI_API_KEY is not configured."
-            ),
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
-        }, 500)
-
-
-    # --------------------------------------------------------
-    # Validate question
-    # --------------------------------------------------------
+    # -----------------------------------------------------
+    # Validation
+    # -----------------------------------------------------
 
     if not question:
 
-        return make_json({
+        return json_reply({
             "success": False,
-            "ready": True,
-            "error": "Missing q.",
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
+            "error": "沒有收到 q"
         }, 400)
 
-
-    if len(question) > MAX_QUESTION_LENGTH:
-
-        return make_json({
-            "success": False,
-            "ready": True,
-            "error": (
-                f"Question too long. "
-                f"Maximum is {MAX_QUESTION_LENGTH} characters."
-            ),
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
-        }, 400)
-
-
-    # --------------------------------------------------------
-    # Validate job
-    # --------------------------------------------------------
 
     if not job_id:
 
-        return make_json({
+        return json_reply({
             "success": False,
-            "ready": True,
-            "error": "Missing job.",
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
+            "error": "沒有收到 job"
         }, 400)
 
 
-    if len(job_id) > MAX_JOB_LENGTH:
+    if not valid_job_id(job_id):
 
-        return make_json({
+        return json_reply({
             "success": False,
-            "ready": True,
             "error": (
-                f"job is too long. "
-                f"Maximum is {MAX_JOB_LENGTH} characters."
-            ),
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
+                "job 只能使用英文字母、數字、"
+                "_、-，長度最多 64"
+            )
         }, 400)
 
 
-    # --------------------------------------------------------
-    # Validate image
-    # --------------------------------------------------------
+    if len(question) > 5000:
 
-    if not valid_image_value(
-        image_url
-    ):
-
-        return make_json({
+        return json_reply({
             "success": False,
-            "ready": True,
-            "error": (
-                "Invalid img. "
-                "Use an http:// URL, https:// URL, "
-                "or data:image/... URL."
-            ),
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
+            "error": "題目過長",
+            "question_length": len(question)
         }, 400)
 
 
-    has_image = bool(image_url)
+    if not OPENAI_API_KEY:
+
+        return json_reply({
+            "success": False,
+            "error": "OPENAI_API_KEY 未設定"
+        }, 500)
 
 
-    # --------------------------------------------------------
-    # Fingerprint
-    #
-    # q + img are both included.
-    #
-    # Therefore:
-    #
-    # job=abc + q=A + img=X
-    #
-    # cannot later become:
-    #
-    # job=abc + q=A + img=Y
-    #
-    # or
-    #
-    # job=abc + q=B + img=X
-    # --------------------------------------------------------
+    if not DATABASE_URL:
 
-    fingerprint = request_fingerprint(
-        question,
-        image_url
+        return json_reply({
+            "success": False,
+            "error": "DATABASE_URL 未設定"
+        }, 500)
+
+
+    current_hash = question_hash(
+        question
     )
 
 
-    # --------------------------------------------------------
-    # Check whether this job already exists.
-    #
-    # We reserve the job before calling OpenAI to avoid two
-    # simultaneous requests starting two OpenAI responses.
-    # --------------------------------------------------------
-
-    should_create = False
-
-    with JOBS_LOCK:
-
-        existing = JOBS.get(
-            job_id
-        )
-
-        if existing is None:
-
-            JOBS[job_id] = {
-                "response_id": None,
-                "fingerprint": fingerprint,
-                "created_at": utc_now(),
-                "has_image": has_image,
-                "state": "creating",
-            }
-
-            should_create = True
-
-        else:
-
-            # ------------------------------------------------
-            # Same job, but different question/image
-            # ------------------------------------------------
-
-            if (
-                existing.get("fingerprint")
-                != fingerprint
-            ):
-
-                return make_json({
-                    "success": False,
-                    "ready": True,
-                    "job": job_id,
-                    "cb": cb,
-                    "error": (
-                        "This job ID is already bound "
-                        "to a different question or image. "
-                        "Use a new job ID."
-                    ),
-                    "verification_code": VERIFICATION_CODE,
-                    "server_time": utc_now(),
-                }, 409)
-
-
-            response_id = existing.get(
-                "response_id"
-            )
-
-            existing_has_image = bool(
-                existing.get(
-                    "has_image",
-                    False
-                )
-            )
-
-
-    # ========================================================
-    # EXISTING JOB
-    # ========================================================
-
-    if not should_create:
-
-        # Another request may still be in the tiny window
-        # between reserving the job and receiving response.id
-        # from OpenAI.
-
-        if not response_id:
-
-            return make_json({
-                "success": True,
-                "ready": False,
-                "job": job_id,
-                "cb": cb,
-                "stage": "creating",
-                "status": "creating",
-                "model": OPENAI_MODEL,
-                "has_image": existing_has_image,
-                "verification_code": VERIFICATION_CODE,
-                "answer_source": "OPENAI_BACKGROUND_API",
-                "server_time": utc_now(),
-            }, 200)
-
-
-        # ----------------------------------------------------
-        # Retrieve the existing OpenAI background response.
-        # ----------------------------------------------------
-
-        try:
-
-            response = client.responses.retrieve(
-                response_id
-            )
-
-        except Exception as exc:
-
-            return make_json({
-                "success": False,
-
-                # This can be a temporary network/API error.
-                # Keep ready=False so the caller may retry.
-                "ready": False,
-
-                "job": job_id,
-                "cb": cb,
-                "stage": "retrieve_error",
-                "error": str(exc),
-                "verification_code": VERIFICATION_CODE,
-                "server_time": utc_now(),
-            }, 502)
-
-
-        return format_openai_response(
-            response=response,
-            job_id=job_id,
-            cb=cb,
-            has_image=existing_has_image,
-        )
-
-
-    # ========================================================
-    # NEW JOB
-    # ========================================================
-
-    # --------------------------------------------------------
-    # Build multimodal input.
-    #
-    # Text-only:
-    #
-    #   content = [
-    #       input_text
-    #   ]
-    #
-    # Image question:
-    #
-    #   content = [
-    #       input_text,
-    #       input_image
-    #   ]
-    # --------------------------------------------------------
-
-    content = [
-        {
-            "type": "input_text",
-            "text": question,
-        }
-    ]
-
-
-    if image_url:
-
-        content.append({
-            "type": "input_image",
-            "image_url": image_url,
-
-            # For exam screenshots/code/text,
-            # use high detail.
-            "detail": "high",
-        })
-
-
-    # --------------------------------------------------------
-    # Create OpenAI background Response
-    # --------------------------------------------------------
+    # =====================================================
+    # Step 1:
+    # Lock job + find/create OpenAI response
+    # =====================================================
 
     try:
 
-        response = client.responses.create(
+        with get_db() as conn:
 
-            model=OPENAI_MODEL,
+            with conn.cursor() as cur:
 
-            instructions=C_EXAM_INSTRUCTIONS,
+                # -------------------------------------------------
+                # PostgreSQL transaction-level advisory lock
+                #
+                # 防止 ChatGPT / crawler 同時重複打同一 job
+                # 而建立多筆付費 OpenAI request
+                # -------------------------------------------------
 
-            input=[
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
-
-            reasoning={
-                "effort": OPENAI_REASONING_EFFORT
-            },
-
-            max_output_tokens=(
-                OPENAI_MAX_OUTPUT_TOKENS
-            ),
-
-            background=True,
-
-            metadata={
-                "relay_job": job_id,
-                "relay_has_image": (
-                    "1"
-                    if has_image
-                    else "0"
-                ),
-            },
-        )
-
-
-    except Exception as exc:
-
-        # Remove reservation so the same job may be retried
-        # after a temporary API error.
-
-        with JOBS_LOCK:
-
-            current = JOBS.get(
-                job_id
-            )
-
-            if (
-                current
-                and current.get("fingerprint")
-                == fingerprint
-                and current.get("response_id")
-                is None
-            ):
-                JOBS.pop(
-                    job_id,
-                    None
+                cur.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtext(%s)
+                    )
+                    """,
+                    (job_id,)
                 )
 
 
-        return make_json({
+                # -------------------------------------------------
+                # 查詢 job
+                # -------------------------------------------------
+
+                cur.execute("""
+                    SELECT
+                        response_id,
+                        question_hash,
+                        question,
+                        model,
+                        reasoning_effort,
+                        status,
+                        answer,
+                        created_at,
+                        completed_at
+
+                    FROM relay_jobs
+
+                    WHERE job_id = %s
+                """, (job_id,))
+
+
+                row = cur.fetchone()
+
+
+                # =================================================
+                # Existing Job
+                # =================================================
+
+                if row:
+
+                    (
+                        response_id,
+                        stored_hash,
+                        stored_question,
+                        stored_model,
+                        stored_effort,
+                        stored_status,
+                        stored_answer,
+                        created_at,
+                        completed_at
+                    ) = row
+
+
+                    # 同一個 job 不能換題目
+                    if stored_hash != current_hash:
+
+                        return json_reply({
+
+                            "success": False,
+
+                            "error":
+                                "此 job 已經被另一個題目使用",
+
+                            "job": job_id
+                        }, 409)
+
+
+                    # ---------------------------------------------
+                    # 已完成，而且答案已經存在 Postgres
+                    #
+                    # 不必再呼叫 OpenAI
+                    # ---------------------------------------------
+
+                    if (
+                        stored_status == "completed"
+                        and stored_answer is not None
+                    ):
+
+                        return json_reply({
+
+                            "success": True,
+
+                            "job": job_id,
+
+                            "cb": cache_buster,
+
+                            "stage": "completed",
+
+                            "status": "completed",
+
+                            "ready": True,
+
+                            "database_cached": True,
+
+                            "verification_code":
+                                "CEXAM-9527",
+
+                            "answer_source":
+                                "POSTGRES_CACHE",
+
+                            "model":
+                                stored_model,
+
+                            "reasoning_effort":
+                                stored_effort,
+
+                            "answer":
+                                stored_answer,
+
+                            "job_created_at":
+                                created_at.isoformat(),
+
+                            "completed_at":
+                                (
+                                    completed_at.isoformat()
+                                    if completed_at
+                                    else None
+                                ),
+
+                            "server_time":
+                                datetime.now().isoformat()
+                        })
+
+
+                # =================================================
+                # New Job
+                # =================================================
+
+                else:
+
+                    print(
+                        "\n=============================="
+                    )
+
+                    print("CREATE NEW JOB")
+                    print("job:", job_id)
+                    print("cb:", cache_buster)
+                    print("model:", OPENAI_MODEL)
+                    print(
+                        "reasoning:",
+                        OPENAI_REASONING_EFFORT
+                    )
+
+                    print("question:")
+                    print(question)
+
+                    print(
+                        "==============================\n"
+                    )
+
+
+                    # ---------------------------------------------
+                    # OpenAI Background Response
+                    # ---------------------------------------------
+
+                    ai_response = client.responses.create(
+
+                        model=OPENAI_MODEL,
+
+                        reasoning={
+                            "effort":
+                                OPENAI_REASONING_EFFORT
+                        },
+
+                        instructions="""
+你是一位專門處理困難 C 語言程式設計題目的程式設計專家。
+
+請仔細分析題目後作答。
+
+要求：
+
+1. 必須使用 C 語言。
+
+2. 完整理解：
+   - 輸入格式
+   - 輸出格式
+   - 題目限制
+   - 邊界條件
+
+3. 對複雜題目先選擇正確演算法，
+   並確認時間複雜度與記憶體需求合理。
+
+4. 特別檢查：
+   - 陣列越界
+   - off-by-one
+   - 整數溢位
+   - signed / unsigned
+   - scanf / printf 格式
+   - 字串結尾
+   - 指標
+   - 動態記憶體
+   - 遞迴深度
+   - 迴圈終止條件
+   - 特殊輸入
+   - 空輸入
+   - 最小值與最大值
+
+5. 輸出格式必須完全符合題目要求，
+   包括空格、換行、大小寫與符號。
+
+6. 不可以自行加入題目沒有提供的限制。
+
+7. 最終答案必須是完整、
+   可以直接編譯執行的 C 程式。
+
+8. 最終輸出只提供 C 程式碼。
+   不要使用 Markdown code fence。
+   不要加入額外解釋。
+""",
+
+                        input=question,
+
+                        max_output_tokens=
+                            OPENAI_MAX_OUTPUT_TOKENS,
+
+                        background=True,
+
+                        # 明確保存 response，
+                        # 方便之後透過 ID retrieve
+                        store=True,
+
+                        metadata={
+                            "relay_job": job_id
+                        }
+                    )
+
+
+                    initial_status = (
+                        ai_response.status
+                        or "queued"
+                    )
+
+
+                    initial_answer = None
+                    completed_now = False
+
+
+                    if initial_status == "completed":
+
+                        initial_answer = (
+                            ai_response.output_text
+                        )
+
+                        completed_now = True
+
+
+                    # ---------------------------------------------
+                    # 儲存 job
+                    # ---------------------------------------------
+
+                    cur.execute("""
+                        INSERT INTO relay_jobs (
+                            job_id,
+                            response_id,
+                            question_hash,
+                            question,
+                            model,
+                            reasoning_effort,
+                            status,
+                            answer,
+                            completed_at
+                        )
+
+                        VALUES (
+                            %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            CASE
+                                WHEN %s
+                                THEN NOW()
+                                ELSE NULL
+                            END
+                        )
+                    """, (
+
+                        job_id,
+
+                        ai_response.id,
+
+                        current_hash,
+
+                        question,
+
+                        OPENAI_MODEL,
+
+                        OPENAI_REASONING_EFFORT,
+
+                        initial_status,
+
+                        initial_answer,
+
+                        completed_now
+                    ))
+
+
+                    # ---------------------------------------------
+                    # 如果建立後立即完成
+                    # ---------------------------------------------
+
+                    if completed_now:
+
+                        return json_reply({
+
+                            "success": True,
+
+                            "job": job_id,
+
+                            "cb": cache_buster,
+
+                            "stage": "completed",
+
+                            "status": "completed",
+
+                            "ready": True,
+
+                            "database_cached": False,
+
+                            "verification_code":
+                                "CEXAM-9527",
+
+                            "answer_source":
+                                "OPENAI_BACKGROUND_API",
+
+                            "model":
+                                ai_response.model,
+
+                            "reasoning_effort":
+                                OPENAI_REASONING_EFFORT,
+
+                            "answer":
+                                initial_answer,
+
+                            "server_time":
+                                datetime.now().isoformat()
+                        })
+
+
+                    # ---------------------------------------------
+                    # Background job 已建立
+                    # ---------------------------------------------
+
+                    return json_reply({
+
+                        "success": True,
+
+                        "job": job_id,
+
+                        "cb": cache_buster,
+
+                        "stage": "submitted",
+
+                        "status": initial_status,
+
+                        "ready": False,
+
+                        "database_cached": False,
+
+                        "answer_source":
+                            "OPENAI_BACKGROUND_API",
+
+                        "model":
+                            OPENAI_MODEL,
+
+                        "reasoning_effort":
+                            OPENAI_REASONING_EFFORT,
+
+                        "verification_code":
+                            "CEXAM-9527",
+
+                        "message":
+                            "AI 正在處理；保持 q 與 job 不變，只修改 cb 後再次查詢。",
+
+                        "server_time":
+                            datetime.now().isoformat()
+                    })
+
+
+        # =================================================
+        # Existing but unfinished job
+        #
+        # 到這裡一定有 response_id
+        # =================================================
+
+        ai_response = client.responses.retrieve(
+            response_id
+        )
+
+        status = ai_response.status
+
+
+        print(
+            "\n=============================="
+        )
+
+        print("CHECK EXISTING JOB")
+        print("job:", job_id)
+        print("cb:", cache_buster)
+        print("status:", status)
+
+        print(
+            "==============================\n"
+        )
+
+
+        # =================================================
+        # Still processing
+        # =================================================
+
+        if status in {
+            "queued",
+            "in_progress"
+        }:
+
+            with get_db() as conn:
+
+                with conn.cursor() as cur:
+
+                    cur.execute("""
+                        UPDATE relay_jobs
+
+                        SET
+                            status = %s,
+                            updated_at = NOW()
+
+                        WHERE job_id = %s
+                    """, (
+                        status,
+                        job_id
+                    ))
+
+                conn.commit()
+
+
+            return json_reply({
+
+                "success": True,
+
+                "job": job_id,
+
+                "cb": cache_buster,
+
+                "stage": "processing",
+
+                "status": status,
+
+                "ready": False,
+
+                "database_cached": False,
+
+                "message":
+                    "答案仍在產生中；請保持 q 與 job 不變，只換新的 cb。",
+
+                "server_time":
+                    datetime.now().isoformat()
+            })
+
+
+        # =================================================
+        # Completed
+        # =================================================
+
+        if status == "completed":
+
+            answer = ai_response.output_text
+
+
+            # -------------------------------------------------
+            # 把最終答案永久存進 Postgres
+            # -------------------------------------------------
+
+            with get_db() as conn:
+
+                with conn.cursor() as cur:
+
+                    cur.execute("""
+                        UPDATE relay_jobs
+
+                        SET
+                            status = 'completed',
+                            answer = %s,
+                            model = %s,
+                            updated_at = NOW(),
+                            completed_at = NOW()
+
+                        WHERE job_id = %s
+                    """, (
+
+                        answer,
+
+                        ai_response.model,
+
+                        job_id
+                    ))
+
+                conn.commit()
+
+
+            return json_reply({
+
+                "success": True,
+
+                "job": job_id,
+
+                "cb": cache_buster,
+
+                "stage": "completed",
+
+                "status": "completed",
+
+                "ready": True,
+
+                "database_cached": False,
+
+                "verification_code":
+                    "CEXAM-9527",
+
+                "answer_source":
+                    "OPENAI_BACKGROUND_API",
+
+                "model":
+                    ai_response.model,
+
+                "reasoning_effort":
+                    OPENAI_REASONING_EFFORT,
+
+                "answer":
+                    answer,
+
+                "server_time":
+                    datetime.now().isoformat()
+            })
+
+
+        # =================================================
+        # Terminal error state
+        # =================================================
+
+        with get_db() as conn:
+
+            with conn.cursor() as cur:
+
+                cur.execute("""
+                    UPDATE relay_jobs
+
+                    SET
+                        status = %s,
+                        updated_at = NOW()
+
+                    WHERE job_id = %s
+                """, (
+                    status,
+                    job_id
+                ))
+
+            conn.commit()
+
+
+        return json_reply({
+
             "success": False,
-            "ready": False,
+
             "job": job_id,
-            "cb": cb,
-            "stage": "create_error",
-            "error": str(exc),
-            "verification_code": VERIFICATION_CODE,
-            "server_time": utc_now(),
-        }, 502)
+
+            "cb": cache_buster,
+
+            "stage": "failed",
+
+            "status": status,
+
+            "ready": False,
+
+            "error":
+                "OpenAI response 未正常完成",
+
+            "server_time":
+                datetime.now().isoformat()
+
+        }, 500)
 
 
-    # --------------------------------------------------------
-    # Save job -> response_id
-    # --------------------------------------------------------
+    # =====================================================
+    # Error
+    # =====================================================
 
-    with JOBS_LOCK:
+    except Exception as e:
 
-        JOBS[job_id] = {
-            "response_id": response.id,
-            "fingerprint": fingerprint,
-            "created_at": JOBS.get(
-                job_id,
-                {}
-            ).get(
-                "created_at",
-                utc_now()
-            ),
-            "has_image": has_image,
-            "state": "submitted",
-        }
+        print(
+            "TASK ERROR:",
+            type(e).__name__,
+            str(e)
+        )
 
 
-    # --------------------------------------------------------
-    # The background job may already be:
-    #
-    # queued
-    # in_progress
-    # completed
-    #
-    # so process the response immediately.
-    # --------------------------------------------------------
+        return json_reply({
 
-    return format_openai_response(
-        response=response,
-        job_id=job_id,
-        cb=cb,
-        has_image=has_image,
-    )
+            "success": False,
+
+            "job": job_id,
+
+            "cb": cache_buster,
+
+            "error":
+                "處理 task 時發生錯誤",
+
+            "error_type":
+                type(e).__name__,
+
+            "server_time":
+                datetime.now().isoformat()
+
+        }, 500)
 
 
-# ============================================================
-# Local development
-#
-# Render normally launches the app using gunicorn,
-# so this block is mainly for local testing.
-# ============================================================
+# =========================================================
+# Old URLs
+# =========================================================
+
+@app.get("/solve")
+def deprecated_solve():
+
+    return json_reply({
+        "success": False,
+        "deprecated": True,
+        "message": "請使用 /task"
+    }, 410)
+
+
+@app.get("/submit")
+def deprecated_submit():
+
+    return json_reply({
+        "success": False,
+        "deprecated": True,
+        "message": "請使用 /task"
+    }, 410)
+
+
+@app.get("/result")
+def deprecated_result():
+
+    return json_reply({
+        "success": False,
+        "deprecated": True,
+        "message": "請使用 /task"
+    }, 410)
+
+
+# =========================================================
+# Local
+# =========================================================
 
 if __name__ == "__main__":
 
     port = int(
         os.environ.get(
             "PORT",
-            "10000"
+            5000
         )
     )
 
     app.run(
         host="0.0.0.0",
-        port=port,
-        debug=False,
+        port=port
     )
